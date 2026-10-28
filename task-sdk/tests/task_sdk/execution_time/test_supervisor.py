@@ -56,7 +56,7 @@ from task_sdk.execution_time import exec_probe_target
 from uuid6 import uuid7
 
 from airflow.executors.workloads import BundleInfo
-from airflow.sdk import DAG, BaseOperator, timezone
+from airflow.sdk import DAG, BaseOperator, task_group, timezone
 from airflow.sdk._shared.secrets_masker import mask_secret
 from airflow.sdk.api import client as sdk_client
 from airflow.sdk.api.client import ServerResponseError
@@ -72,7 +72,9 @@ from airflow.sdk.api.datamodels._generated import (
     PreviousTIResponse,
     TaskInstance,
     TaskInstanceState,
+    TIRunContext,
 )
+from airflow.sdk.definitions._internal.loop import create_loop
 from airflow.sdk.exceptions import AirflowRuntimeError, ErrorType, TaskAlreadyRunningError
 from airflow.sdk.execution_time import supervisor, task_runner
 from airflow.sdk.execution_time.comms import (
@@ -139,12 +141,12 @@ from airflow.sdk.execution_time.comms import (
     SentFDs,
     SetAssetStateStoreByName,
     SetAssetStateStoreByUri,
-    SetExecutionTimeout,
     SetRenderedFields,
     SetRenderedMapIndex,
     SetTaskStateStore,
     SetXCom,
     SkipDownstreamTasks,
+    StartExecutionTimeout,
     StartupDetails,
     SucceedTask,
     TaskBreadcrumbsResult,
@@ -187,6 +189,7 @@ from airflow.sdk.execution_time.supervisor import (
 from airflow.sdk.execution_time.task_runner import run
 
 from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.xcom_backends import SerializeValueOnlyXCom
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1706,16 +1709,9 @@ class TestWatchedSubprocess:
         mocker.patch("airflow.sdk.execution_time.supervisor.KILLED_TASK_CLEANUP_TIME", 5.0)
         mock_kill = mocker.patch("airflow.sdk.execution_time.supervisor.WatchedSubprocess.kill")
         monotonic = mocker.patch("time.monotonic", autospec=True, return_value=1.0)
-        proc = ActivitySubprocess(
-            process_log=mocker.MagicMock(),
-            id=TI_ID,
-            pid=12345,
-            stdin=mocker.Mock(),
-            process=mocker.Mock(),
-            client=mocker.Mock(),
-        )
+        proc = self._start_activity_subprocess(mocker, execution_timeout=30.0)
 
-        proc._handle_request(SetExecutionTimeout(timeout_seconds=30), log=mocker.Mock(), req_id=1)
+        proc._handle_request(StartExecutionTimeout(), log=mocker.Mock(), req_id=1)
 
         monotonic.return_value += 34
         proc._handle_execution_timeout_if_needed()
@@ -1726,12 +1722,57 @@ class TestWatchedSubprocess:
         mock_kill.assert_called_once_with(signal.SIGTERM, force=True, escalation_delay=5.0)
         proc.process_log.error.assert_called_once_with(
             "Task did not stop before execution_timeout elapsed; terminating process",
-            timeout_seconds=30,
+            timeout_seconds=30.0,
             grace_period_seconds=5.0,
         )
 
         proc._handle_execution_timeout_if_needed()
         mock_kill.assert_called_once()
+
+    @staticmethod
+    def _start_activity_subprocess(mocker, *, execution_timeout):
+        client = mocker.Mock()
+        client.task_instances.start.return_value = TIRunContext.model_construct(
+            should_retry=False, execution_timeout=execution_timeout
+        )
+        proc = ActivitySubprocess(
+            process_log=mocker.MagicMock(),
+            id=TI_ID,
+            pid=12345,
+            stdin=mocker.Mock(),
+            process=mocker.Mock(),
+            client=client,
+        )
+        mocker.patch.object(ActivitySubprocess, "send_msg", autospec=True)
+        proc._on_child_started(
+            ti=TaskInstance(
+                id=TI_ID, task_id="b", dag_id="c", run_id="d", try_number=1, dag_version_id=uuid7()
+            ),
+            dag_rel_path="d.py",
+            bundle_info=BundleInfo(name="my-bundle", version=None),
+            sentry_integration="",
+        )
+        return proc
+
+    def test_python_task_does_not_arm_execution_timeout_at_startup(self, mocker):
+        mock_kill = mocker.patch("airflow.sdk.execution_time.supervisor.WatchedSubprocess.kill")
+        monotonic = mocker.patch("time.monotonic", autospec=True, return_value=1.0)
+        proc = self._start_activity_subprocess(mocker, execution_timeout=30.0)
+
+        monotonic.return_value += 3600
+        proc._handle_execution_timeout_if_needed()
+        mock_kill.assert_not_called()
+
+    def test_start_execution_timeout_without_timeout_never_kills_task(self, mocker):
+        mock_kill = mocker.patch("airflow.sdk.execution_time.supervisor.WatchedSubprocess.kill")
+        monotonic = mocker.patch("time.monotonic", autospec=True, return_value=1.0)
+        proc = self._start_activity_subprocess(mocker, execution_timeout=None)
+
+        proc._handle_request(StartExecutionTimeout(), log=mocker.Mock(), req_id=1)
+
+        monotonic.return_value += 3600
+        proc._handle_execution_timeout_if_needed()
+        mock_kill.assert_not_called()
 
     @pytest.mark.parametrize(
         ("terminal_state", "exit_code"),
@@ -1744,15 +1785,8 @@ class TestWatchedSubprocess:
         mocker.patch("airflow.sdk.execution_time.supervisor.KILLED_TASK_CLEANUP_TIME", 5.0)
         mock_kill = mocker.patch("airflow.sdk.execution_time.supervisor.WatchedSubprocess.kill")
         monotonic = mocker.patch("time.monotonic", autospec=True, return_value=1.0)
-        proc = ActivitySubprocess(
-            process_log=mocker.MagicMock(),
-            id=TI_ID,
-            pid=12345,
-            stdin=mocker.Mock(),
-            process=mocker.Mock(),
-            client=mocker.Mock(),
-        )
-        proc._handle_request(SetExecutionTimeout(timeout_seconds=30), log=mocker.Mock(), req_id=1)
+        proc = self._start_activity_subprocess(mocker, execution_timeout=30.0)
+        proc._handle_request(StartExecutionTimeout(), log=mocker.Mock(), req_id=1)
         proc._terminal_state = terminal_state
         proc._exit_code = exit_code
 
@@ -1776,6 +1810,12 @@ class TestWatchedSubprocess:
         # Far longer than the test may take: the monitor loop has to wake up for the timeout on its own
         mocker.patch("airflow.sdk.execution_time.supervisor.MIN_HEARTBEAT_INTERVAL", 30)
 
+        client_with_ti_start.task_instances.start.return_value = (
+            client_with_ti_start.task_instances.start.return_value.model_copy(
+                update={"execution_timeout": 0.1}
+            )
+        )
+
         def subprocess_main():
             import signal
 
@@ -1789,7 +1829,7 @@ class TestWatchedSubprocess:
                 print("Ignoring SIGTERM", file=sys.stderr)
 
             signal.signal(signal.SIGTERM, _on_term)
-            comms.send(SetExecutionTimeout(timeout_seconds=0.1))
+            comms.send(StartExecutionTimeout())
             sleep(30)
             exit(5)
 
@@ -2731,8 +2771,8 @@ REQUEST_TEST_CASES = [
         test_id="set_rtif",
     ),
     RequestTestCase(
-        message=SetExecutionTimeout(timeout_seconds=30.0),
-        test_id="set_execution_timeout",
+        message=StartExecutionTimeout(),
+        test_id="start_execution_timeout",
     ),
     RequestTestCase(
         message=SetRenderedMapIndex(rendered_map_index="Label: task_1"),
@@ -4901,6 +4941,32 @@ class TestSetSupervisorComms:
 
 
 class TestInProcessTestSupervisor:
+    def test_rejects_loop_dag_with_legacy_xcom_backend(self, mocker, monkeypatch):
+        @task_group
+        def body():
+            BaseOperator(task_id="work")
+
+        with DAG(dag_id="loop_dag") as dag:
+            create_loop(body, max_iterations=2)
+        task = dag.task_dict["body.work"]
+        ti = TaskInstance(
+            id=uuid7(),
+            dag_version_id=uuid7(),
+            dag_id="loop_dag",
+            task_id=task.task_id,
+            run_id="test_run",
+            try_number=1,
+            queue="default",
+        )
+        client = mocker.Mock(spec=sdk_client.Client)
+        client.task_instances = mocker.create_autospec(sdk_client.TaskInstanceOperations, instance=True)
+        monkeypatch.setattr(task_runner, "XCom", SerializeValueOnlyXCom)
+
+        with pytest.raises(TypeError, match="uses a loop"):
+            InProcessTestSupervisor.start(what=ti, task=task, client=client)
+
+        client.task_instances.start.assert_not_called()
+
     @pytest.mark.parametrize("callback_error", [None, RuntimeError])
     def test_retry_callback_finishes_before_retry_report(self, make_ti_context, mocker, callback_error):
         client = mocker.Mock(spec=sdk_client.Client)
@@ -5518,6 +5584,30 @@ def test_process_log_messages_from_subprocess(monkeypatch, caplog):
         (None, logging.DEBUG, "A debug"),
         (None, logging.ERROR, "An error"),
     ]
+
+
+@pytest.mark.parametrize(
+    "bad_timestamp",
+    [
+        pytest.param(1697190085, id="epoch-number"),
+        pytest.param("2026-10-13T17:41", id="no-seconds"),
+        # msgspec raises a plain DecodeError (not a ValidationError) for the newline, so this case
+        # fails if the except clause only catches ValidationError.
+        pytest.param("2026-10-13\n17:41:25", id="newline"),
+    ],
+)
+def test_process_log_messages_keeps_line_with_invalid_timestamp(bad_timestamp, caplog, time_machine):
+    time_machine.move_to(timezone.datetime(2026, 10, 15, 8, 0), tick=False)
+
+    gen = process_log_messages_from_subprocess(loggers=(structlog.get_logger(),))
+    next(gen)
+
+    gen.send(
+        msgspec.json.encode({"level": "info", "event": "Batch done", "timestamp": bad_timestamp}) + b"\n"
+    )
+
+    assert caplog.messages == ["Batch done"]
+    assert {"timestamp": "2026-10-15T08:00:00Z", "invalid_timestamp": bad_timestamp} in caplog
 
 
 @pytest.mark.parametrize(
